@@ -9,7 +9,7 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
   EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
-  K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+ # K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
   IMAGE_TAG: ${{ github.sha }}
 
 jobs:
@@ -92,15 +92,22 @@ jobs:
           AWS_REGION: ${{ env.AWS_REGION }}
           EKS_CLUSTER_NAME: ${{ env.EKS_CLUSTER_NAME }}
 
-      - name: Deploy with Helm (default namespace)
+      - name: Create namespace if not exists
+        run: |
+          kubectl create namespace $K8S_NAMESPACE || echo "Namespace exists"
+        env:
+          K8S_NAMESPACE: ${{ env.K8S_NAMESPACE }}
+
+      - name: Deploy with Helm
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          K8S_NAMESPACE: ${{ env.K8S_NAMESPACE }}
         run: |
           IMAGE_REPO="$REGISTRY/$ECR_REPOSITORY"
 
           helm upgrade --install demo-k8s ./helm/demo-k8s \
-            --namespace default \
+            --namespace $K8S_NAMESPACE \
             --set image.repository=$IMAGE_REPO \
             --set image.tag=$IMAGE_TAG
