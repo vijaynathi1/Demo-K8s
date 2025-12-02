@@ -9,9 +9,8 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
   EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
-  # If you want to force a namespace from repo vars, uncomment:
-  # K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
   IMAGE_TAG: ${{ github.sha }}
+  K8S_NAMESPACE: demo-k8s
 
 jobs:
   ci:
@@ -48,7 +47,6 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build and push image to ECR
-        id: build-image
         uses: docker/build-push-action@v6
         with:
           context: ./app
@@ -71,7 +69,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to Amazon ECR (for registry URL)
+      - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
@@ -92,102 +90,69 @@ jobs:
       - name: Update kubeconfig for EKS
         run: |
           aws eks update-kubeconfig \
-            --name "$EKS_CLUSTER_NAME" \
-            --region "$AWS_REGION"
-        env:
-          AWS_REGION: ${{ env.AWS_REGION }}
-          EKS_CLUSTER_NAME: ${{ env.EKS_CLUSTER_NAME }}
-
-      - name: Ensure K8S_NAMESPACE is set (defaults to demo-k8s)
-        run: |
-          # If env var K8S_NAMESPACE is empty, set a sensible default.
-          if [ -z "${K8S_NAMESPACE:-}" ]; then
-            echo "K8S_NAMESPACE is empty — defaulting to 'demo-k8s'"
-            echo "K8S_NAMESPACE=demo-k8s" >> $GITHUB_ENV
-          else
-            echo "Using existing K8S_NAMESPACE='${K8S_NAMESPACE}'"
-            echo "K8S_NAMESPACE=${K8S_NAMESPACE}" >> $GITHUB_ENV
-          fi
-        # don't try to interpolate ${{ env.K8S_NAMESPACE }} here because GITHUB_ENV update
-        # is intended to be used by later steps in the job
+            --name "${EKS_CLUSTER_NAME}" \
+            --region "${AWS_REGION}"
 
       - name: Create namespace if not exists
         run: |
-          if [ -n "${K8S_NAMESPACE:-}" ]; then
-            kubectl get namespace "${K8S_NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${K8S_NAMESPACE}"
-          else
-            echo "K8S_NAMESPACE is empty — skipping namespace creation (deploying to default)"
-          fi
+          kubectl get namespace "${K8S_NAMESPACE}" >/dev/null 2>&1 || \
+          kubectl create namespace "${K8S_NAMESPACE}"
 
-      - name: Helm lint
-        run: |
-          helm lint ./helm/demo-k8s || true
+      - name: Helm Lint
+        run: helm lint ./helm/demo-k8s || true
 
-      - name: Helm template (render & verify)
+      - name: Helm Template (render preview)
         run: |
           helm template demo-k8s ./helm/demo-k8s \
-            --namespace "${K8S_NAMESPACE:-default}" \
+            --namespace "${K8S_NAMESPACE}" \
             --set image.repository="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}" \
-            --set image.tag="${{ env.IMAGE_TAG }}" \
+            --set image.tag="${IMAGE_TAG}" \
             > rendered.yaml
-          echo "Rendered template preview (first 200 lines):"
-          head -n 200 rendered.yaml || true
+          echo "=== Template Preview (first 200 lines) ==="
+          head -n 200 rendered.yaml
 
-      - name: Deploy with Helm (increased timeout, create-namespace)
+      - name: Deploy with Helm (no wait, always debug after)
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
-          # K8S_NAMESPACE comes from GITHUB_ENV set earlier in this job
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          K8S_NAMESPACE: ${{ env.K8S_NAMESPACE }}
         run: |
           set -euo pipefail
-
+          
           IMAGE_REPO="${REGISTRY}/${ECR_REPOSITORY}"
           RELEASE_NAME="demo-k8s"
-          CHART_PATH="./helm/demo-k8s"
+          
+          echo "Deploying release=${RELEASE_NAME}"
+          echo "Image = ${IMAGE_REPO}:${IMAGE_TAG}"
+          echo "Namespace = ${K8S_NAMESPACE}"
 
-          # Build namespace arg only if non-empty to avoid passing an empty --namespace
-          if [ -n "${K8S_NAMESPACE:-}" ]; then
-            NAMESPACE_ARG=(--namespace "${K8S_NAMESPACE}")
-          else
-            NAMESPACE_ARG=()
-          fi
-
-          echo "Deploying ${RELEASE_NAME} chart=${CHART_PATH} image=${IMAGE_REPO}:${IMAGE_TAG} namespace='${K8S_NAMESPACE:-default}'"
-
-          # NOTE: increase timeout to 15m to allow LoadBalancer/ELB provisioning; use --create-namespace
-          # NOTE: removing --atomic here so the release remains for debugging if something fails.
-          helm upgrade --install "${RELEASE_NAME}" "${CHART_PATH}" "${NAMESPACE_ARG[@]}" \
+          # Install without waiting so we can capture logs
+          helm upgrade --install "${RELEASE_NAME}" ./helm/demo-k8s \
+            --namespace "${K8S_NAMESPACE}" \
             --create-namespace \
             --set image.repository="${IMAGE_REPO}" \
-            --set image.tag="${IMAGE_TAG}" \
-            --wait --timeout 15m
+            --set image.tag="${IMAGE_TAG}"
 
-      - name: Show cluster resources (on failure) — debug info
-        if: failure()
+          # Allow pods to start
+          sleep 20
+
+      - name: Debug — Show pods, events, logs
         run: |
-          NAMESPACE="${K8S_NAMESPACE:-default}"
-          echo "=== DEBUG: namespace=${NAMESPACE} ==="
-          echo "Namespaces:"
-          kubectl get namespaces || true
-          echo ""
-          echo "All resources in namespace:"
-          kubectl get all -n "${NAMESPACE}" -o wide || true
-          echo ""
-          echo "Describe pods:"
-          kubectl describe pods -n "${NAMESPACE}" || true
-          echo ""
-          echo "Recent events (namespace):"
-          kubectl get events -n "${NAMESPACE}" --sort-by='.metadata.creationTimestamp' || true
-          echo ""
-          echo "Describe services:"
-          kubectl describe svc -n "${NAMESPACE}" || true
-          echo ""
-          echo "Node status:"
-          kubectl get nodes -o wide || true
-          echo ""
-          # Attempt to print logs for each pod (last 200 lines)
-          for p in $(kubectl get pods -n "${NAMESPACE}" -o jsonpath='{.items[*].metadata.name}'); do
-            echo "---- Logs for pod: $p ----"
-            kubectl logs "$p" -n "${NAMESPACE}" --all-containers=true --tail=200 || true
+          echo "=== PODS ==="
+          kubectl get pods -n "${K8S_NAMESPACE}" -o wide || true
+
+          echo "=== SERVICES ==="
+          kubectl get svc -n "${K8S_NAMESPACE}" -o wide || true
+
+          echo "=== EVENTS ==="
+          kubectl get events -n "${K8S_NAMESPACE}" --sort-by=.metadata.creationTimestamp || true
+
+          echo "=== DESCRIBE PODS ==="
+          kubectl describe pods -n "${K8S_NAMESPACE}" || true
+
+          echo "=== LOGS ==="
+          for p in $(kubectl get pods -n "${K8S_NAMESPACE}" -o jsonpath='{.items[*].metadata.name}'); do
+            echo "--- Logs for $p ---"
+            kubectl logs $p -n "${K8S_NAMESPACE}" --all-containers=true --tail=200 || true
           done
